@@ -8,6 +8,13 @@ import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import br.com.ccgeo.obd.ai.ChatMsg
+import br.com.ccgeo.obd.ai.ClaudeClient
+import br.com.ccgeo.obd.ai.ClaudeModels
+import br.com.ccgeo.obd.ai.Diagnostics
+import br.com.ccgeo.obd.ai.DtcInput
+import br.com.ccgeo.obd.ai.Report
+import br.com.ccgeo.obd.ai.Sample
 import br.com.ccgeo.obd.bt.BleTransport
 import br.com.ccgeo.obd.bt.ClassicTransport
 import br.com.ccgeo.obd.bt.DeviceScanner
@@ -58,6 +65,14 @@ data class UiState(
     val recordRows: Int = 0,
     val terminal: List<String> = emptyList(),
     val lastDevice: FoundDevice? = null,
+    // IA
+    val report: Report? = null,
+    val aiChat: List<ChatMsg> = emptyList(),
+    val aiBusy: Boolean = false,
+    val aiError: String? = null,
+    val aiKeySet: Boolean = false,
+    val aiModel: String = ClaudeModels.DEFAULT,
+    val vehicle: String = "",
 )
 
 @SuppressLint("MissingPermission")
@@ -70,7 +85,14 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
 
     private val prefs = app.getSharedPreferences("obd", Context.MODE_PRIVATE)
 
-    private val _state = MutableStateFlow(UiState(lastDevice = loadLastDevice()))
+    private val _state = MutableStateFlow(
+        UiState(
+            lastDevice = loadLastDevice(),
+            aiKeySet = !prefs.getString("ai_key", null).isNullOrBlank(),
+            aiModel = prefs.getString("ai_model", null) ?: ClaudeModels.DEFAULT,
+            vehicle = prefs.getString("vehicle", null) ?: "",
+        )
+    )
     val state: StateFlow<UiState> = _state
 
     private var transport: ObdTransport? = null
@@ -80,6 +102,10 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     private var pollWanted = false
 
     private val recordRows = ArrayList<String>()
+
+    /** Últimos ~5 min de leituras, usados pela IA. */
+    private val history = ArrayDeque<Sample>()
+    private val HISTORY_MAX = 300
     private var recordHeader: List<PidDef> = emptyList()
 
     // ---------- Conexão ----------
@@ -92,6 +118,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun connect(d: FoundDevice) {
+        synchronized(history) { history.clear() }
         scanner.stop()
         connectJob?.cancel()
         closeLink()
@@ -99,7 +126,8 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
             _state.update {
                 it.copy(conn = Conn.CONNECTING, status = "Conectando a ${d.name}…", deviceName = d.name,
                     info = null, supported = emptyList(), values = emptyMap(), vin = null,
-                    stored = emptyList(), pending = emptyList(), permanent = emptyList(), dtcRead = false, dtcMsg = null)
+                    stored = emptyList(), pending = emptyList(), permanent = emptyList(), dtcRead = false, dtcMsg = null,
+                    report = null, aiChat = emptyList(), aiError = null)
             }
             val a = adapter
             if (a == null) { fail("Este aparelho não tem Bluetooth"); return@launch }
@@ -238,6 +266,13 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                         )
                     }
                     if (_state.value.recording) appendRecordRow()
+                    _state.value.let { s ->
+                        synchronized(history) {
+                            history.addLast(Sample(System.currentTimeMillis(), s.values, s.voltage))
+                            while (history.size > HISTORY_MAX) history.removeFirst()
+                        }
+                    }
+                    if (cycle % 3 == 0) refreshReport()
                     cycle++
                     if (active.isEmpty()) kotlinx.coroutines.delay(500)
                 }
@@ -267,6 +302,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                         dtcMsg = if (stored.isEmpty() && pending.isEmpty() && perm.isEmpty()) "Nenhum código de falha encontrado" else null,
                     )
                 }
+                refreshReport()
             } catch (ex: Exception) {
                 if (ex is CancellationException) throw ex
                 _state.update { it.copy(dtcBusy = false) }
@@ -398,6 +434,86 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
             ble = prefs.getBoolean("ble", false),
             bonded = true,
         )
+    }
+
+    // ---------- Inteligência artificial ----------
+
+    private fun historySnapshot(): List<Sample> = synchronized(history) { history.toList() }
+
+    private fun dtcInput(s: UiState) = DtcInput(
+        milOn = s.milOn,
+        read = s.dtcRead,
+        stored = s.stored.map { it.code to it.desc },
+        pending = s.pending.map { it.code to it.desc },
+        permanent = s.permanent.map { it.code to it.desc },
+    )
+
+    fun refreshReport() {
+        val r = Diagnostics.analyze(historySnapshot(), dtcInput(_state.value))
+        _state.update { it.copy(report = r) }
+    }
+
+    /** Lê os códigos uma vez ao abrir a aba IA, para entrarem na análise. */
+    fun ensureDtcsRead() {
+        val s = _state.value
+        if (s.conn == Conn.CONNECTED && !s.dtcRead && !s.dtcBusy) readDtcs()
+    }
+
+    fun saveAiSettings(key: String?, model: String, vehicle: String) {
+        val ed = prefs.edit().putString("ai_model", model).putString("vehicle", vehicle.trim())
+        if (key != null) ed.putString("ai_key", key.trim())
+        ed.apply()
+        _state.update {
+            it.copy(
+                aiModel = model,
+                vehicle = vehicle.trim(),
+                aiKeySet = !(key?.trim() ?: prefs.getString("ai_key", null)).isNullOrBlank(),
+                aiError = null,
+            )
+        }
+    }
+
+    fun resetAi() = _state.update { it.copy(aiChat = emptyList(), aiError = null) }
+
+    /** Primeira chamada (question = null) envia todos os dados; as seguintes enviam a pergunta + leituras atuais. */
+    fun askAi(question: String?) {
+        val key = prefs.getString("ai_key", null)
+        if (key.isNullOrBlank()) {
+            _state.update { it.copy(aiError = "Configure sua chave da API da Anthropic (ícone de engrenagem).") }
+            return
+        }
+        val s = _state.value
+        if (s.aiBusy) return
+        val samples = historySnapshot()
+        val report = Diagnostics.analyze(samples, dtcInput(s))
+
+        val newMsg = if (s.aiChat.isEmpty() || question == null) {
+            val ctxText = Diagnostics.contextText(samples, report, dtcInput(s), s.vehicle, s.vin, s.info?.protocol)
+            val ask = question?.takeIf { it.isNotBlank() } ?: "Analise os parâmetros deste veículo e diga o que está fora do normal."
+            ChatMsg("user", ctxText + "\n\nPEDIDO: " + ask, display = "📊 Dados enviados: ${report.samples} leituras (${report.seconds} s)\n$ask")
+        } else {
+            val snap = Diagnostics.snapshotText(samples)
+            ChatMsg("user", question + if (snap.isNotEmpty()) "\n\n($snap)" else "", display = question)
+        }
+        val base = if (question == null) emptyList<ChatMsg>() else s.aiChat
+        val convo = base + newMsg
+        _state.update { it.copy(aiChat = convo, aiBusy = true, aiError = null, report = report) }
+
+        viewModelScope.launch {
+            try {
+                val answer = ClaudeClient(key, s.aiModel).send(ClaudeClient.SYSTEM_PROMPT, convo)
+                _state.update { it.copy(aiChat = convo + ChatMsg("assistant", answer), aiBusy = false) }
+            } catch (ex: Exception) {
+                if (ex is CancellationException) throw ex
+                val msg = when (ex) {
+                    is java.net.UnknownHostException -> "Sem internet. A análise local continua funcionando."
+                    is java.net.SocketTimeoutException -> "A IA demorou demais para responder. Tente de novo."
+                    else -> ex.message ?: "Erro ao consultar a IA"
+                }
+                // remove a pergunta sem resposta para poder reenviar
+                _state.update { it.copy(aiChat = base, aiBusy = false, aiError = msg) }
+            }
+        }
     }
 
     override fun onCleared() {

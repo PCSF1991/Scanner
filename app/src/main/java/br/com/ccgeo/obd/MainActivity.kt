@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Info
@@ -55,6 +56,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import br.com.ccgeo.obd.ui.AiScreen
 import br.com.ccgeo.obd.ui.AppTheme
 import br.com.ccgeo.obd.ui.ConnectScreen
 import br.com.ccgeo.obd.ui.Danger
@@ -91,6 +93,7 @@ private data class Tab(val title: String, val icon: ImageVector)
 private val TABS = listOf(
     Tab("Conectar", Icons.Filled.Bluetooth),
     Tab("Painel", Icons.Filled.Speed),
+    Tab("IA", Icons.Filled.AutoAwesome),
     Tab("Falhas", Icons.Filled.Warning),
     Tab("Info", Icons.Filled.Info),
     Tab("Terminal", Icons.Filled.Code),
@@ -132,7 +135,7 @@ private fun App(vm: ObdViewModel) {
     }
 
     // Leitura contínua só com o Painel aberto (libera o barramento para as outras telas).
-    LaunchedEffect(tab, st.conn) { vm.setPolling(tab == 1 && st.conn == Conn.CONNECTED) }
+    LaunchedEffect(tab, st.conn) { vm.setPolling((tab == 1 || tab == 2) && st.conn == Conn.CONNECTED) }
 
     // Ao conectar, vai direto para o Painel.
     LaunchedEffect(st.conn) { if (st.conn == Conn.CONNECTED && tab == 0) tab = 1 }
@@ -201,9 +204,17 @@ private fun App(vm: ObdViewModel) {
                     onToggleRecord = { vm.toggleRecording() },
                     onExport = { csvLauncher.launch(vm.suggestedCsvName()) },
                 )
-                2 -> DtcScreen(st, onRead = { vm.readDtcs() }, onClear = { vm.clearDtcs() })
-                3 -> InfoScreen(st, onReadVin = { vm.readVin() })
-                4 -> TerminalScreen(
+                2 -> AiScreen(
+                    st = st,
+                    onOpen = { vm.ensureDtcsRead(); vm.refreshReport() },
+                    onAnalyze = { vm.askAi(null) },
+                    onAsk = { vm.askAi(it) },
+                    onReset = { vm.resetAi() },
+                    onSaveSettings = { k, m, v -> vm.saveAiSettings(k, m, v) },
+                )
+                3 -> DtcScreen(st, onRead = { vm.readDtcs() }, onClear = { vm.clearDtcs() })
+                4 -> InfoScreen(st, onReadVin = { vm.readVin() })
+                5 -> TerminalScreen(
                     lines = st.terminal,
                     connected = st.conn == Conn.CONNECTED,
                     onSend = { vm.sendRaw(it) },

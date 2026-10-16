@@ -7,6 +7,7 @@ App Android (Kotlin + Jetpack Compose) para scanners ELM327 como o **KUULAA OBDI
 - **Painel**: RPM e velocidade em mostradores; temperatura, carga, borboleta, MAP, MAF, avanço, correções de combustível, nível de tanque, % de etanol (flex), temp. do óleo etc. — só os PIDs que o carro suporta. Tensão da bateria (ATRV).
 - **Gravação CSV**: grava as leituras e exporta CSV (separador `;`, vírgula decimal — abre direto no Excel PT-BR).
 - **Falhas**: status da luz de injeção, códigos armazenados / pendentes / permanentes com descrição em português, botão de pesquisa e apagar códigos (modo 04) com confirmação.
+- **IA**: diagnóstico automático no aparelho (sem internet) com nota de 0–100 e achados por gravidade — mistura (fuel trims), vácuo/MAP, temperatura, carga elétrica, marcha lenta, códigos — e análise completa pelo Claude (API da Anthropic) com conversa para perguntas. Configure a chave da API e o veículo no ícone de engrenagem.
 - **Info**: VIN (chassi), protocolo, firmware do adaptador, lista de sensores suportados.
 - **Terminal**: envio livre de comandos AT/OBD com atalhos.
 
